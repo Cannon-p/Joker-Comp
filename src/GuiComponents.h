@@ -18,6 +18,9 @@
 
 #include <JuceHeader.h>
 
+#include <functional>
+#include <memory>
+
 //==============================================================================
 namespace Theme {
 inline const juce::Colour background = juce::Colour(0xFF0E1116);
@@ -44,6 +47,10 @@ inline juce::Font boldFont(float height) {
 }  // namespace Theme
 
 //==============================================================================
+/** Small floating popup that lets the user type an exact value into a knob.
+    Typed values are snapped to the knob's step size and clamped to its range. */
+class KnobValueEditor;  // fwd decl (owned by SleekRotary)
+
 /** A custom-painted rotary knob driven by a Slider::RotaryVerticalDrag. */
 class SleekRotary : public juce::Slider {
  public:
@@ -64,7 +71,23 @@ class SleekRotary : public juce::Slider {
 
   void paint(juce::Graphics &g) override;
 
+  /** Fine-grained mouse wheel: one notch moves a small, parameter-aware step
+      (0.5% of the range, at least one interval) instead of the default ~15%
+      jump. Values are snapped/clamped by Slider::setValue. */
+  void mouseWheelMove(const juce::MouseEvent &e,
+                      const juce::MouseWheelDetails &wheel) override;
+
+  /** Double-click opens a numeric entry popup instead of resetting to the
+      default value. */
+  void mouseDown(const juce::MouseEvent &e) override;
+
+  /** Swallows the framework's double-click callback so the base Slider can
+      never restore the default value on a double-click. */
+  void mouseDoubleClick(const juce::MouseEvent &) override;
+
  private:
+  void showValueEditor();
+
   float valueToAngle() const noexcept {
     if (getMaximum() - getMinimum() <= 0)
       return 0.0f;
@@ -75,6 +98,44 @@ class SleekRotary : public juce::Slider {
   }
 
   std::function<juce::String(float)> fmt_;
+  double wheelAccum_ = 0.0;
+  std::unique_ptr<KnobValueEditor> valueEditor_;
+};
+
+//==============================================================================
+/** A small desktop popup with a single-line numeric editor for a knob. The
+    value is parsed, snapped to the slider's interval and clamped to its range
+    on Enter. Created and released by SleekRotary. */
+class KnobValueEditor : public juce::Component,
+                        public juce::TextEditor::Listener {
+ public:
+  KnobValueEditor(juce::Slider &slider, const juce::String &caption);
+  ~KnobValueEditor() override = default;
+
+  /** Positions the popup near the knob and grabs keyboard focus. */
+  void show();
+
+  /** Parses text, snaps it onto the step grid and clamps to the range, then
+      applies it to the slider. Exposed so tests can drive it directly. */
+  void applyText(const juce::String &text);
+
+  void paint(juce::Graphics &g) override;
+  void resized() override;
+
+  void textEditorReturnKeyPressed(juce::TextEditor &) override;
+  void textEditorEscapeKeyPressed(juce::TextEditor &) override;
+  void textEditorFocusLost(juce::TextEditor &) override;
+
+  /** The owning knob sets this to release its handle once the popup closes. */
+  std::function<void()> onClose;
+
+ private:
+  void close(bool apply);
+
+  juce::Slider &slider_;
+  juce::Label caption_;
+  juce::TextEditor editor_;
+  bool closing_ = false;
 };
 
 //==============================================================================

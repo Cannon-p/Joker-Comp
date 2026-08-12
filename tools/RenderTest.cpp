@@ -280,6 +280,108 @@ int main(int argc, char **argv) {
     for (int r = 0; r < 5; ++r) runOnce();
   }
 
+  // ---- Value-entry popup: snap to step, clamp to min/max ----
+  bool valueInputOk = false;
+  bool wheelOk = false;
+  bool doubleClickOk = false;
+  {
+    SleekRotary knob;  // 1 dB-step knob like input/output gain
+    knob.setRange(-21.0, 21.0, 1.0);
+    knob.setValue(0.0, juce::dontSendNotification);
+    KnobValueEditor editor(knob, "test");
+
+    editor.applyText("7.4");   // snap to nearest 1 dB step
+    const double vSnap = knob.getValue();
+    editor.applyText("999");   // clamp above max
+    const double vClampHi = knob.getValue();
+    editor.applyText("-999");  // clamp below min
+    const double vClampLo = knob.getValue();
+
+    // Choice-style knob: 0..8 in whole steps.
+    SleekRotary choice;
+    choice.setRange(0.0, 8.0, 1.0);
+    choice.setValue(0.0, juce::dontSendNotification);
+    KnobValueEditor choiceEditor(choice, "test");
+    choiceEditor.applyText("6.6");
+    const double choiceVal = choice.getValue();
+
+    valueInputOk =
+        std::abs(vSnap - 7.0) < 1.0e-6 &&
+        std::abs(vClampHi - 21.0) < 1.0e-6 &&
+        std::abs(vClampLo - (-21.0)) < 1.0e-6 && std::abs(choiceVal - 7.0) < 1.0e-6;
+    std::cout << "[valueInput]  7.4->" << vSnap << " 999->" << vClampHi
+              << " -999->" << vClampLo << " choice(6.6)->" << choiceVal
+              << " " << (valueInputOk ? "ok" : "FAIL") << std::endl;
+  }
+
+  // ---- Mouse wheel: one notch moves a small parameter-aware step ----
+  // JUCE Windows sends deltaY ~= 120/512 ~= 0.234 per physical notch, so the
+  // test must use that real value (a 1.0 delta would pass trivially and miss
+  // the bug where sub-interval moves were snapped back to zero).
+  {
+    SleekRotary wheelKnob;  // threshold-like: -60..4 dB, 0.5 dB step
+    wheelKnob.setRange(-60.0, 4.0, 0.5);
+    wheelKnob.setValue(-20.0, juce::dontSendNotification);
+
+    juce::MouseWheelDetails wd{};
+    wd.deltaY = (float)(120.0 / 512.0);  // one real Windows notch
+    auto &src = juce::Desktop::getInstance().getMainMouseSource();
+    juce::MouseEvent wev(src, juce::Point<float>(), juce::ModifierKeys(),
+                         0.0f, 0.0f, 0.0f, 0.0f, 0.0f, &wheelKnob, &wheelKnob,
+                         juce::Time(), juce::Point<float>(), juce::Time(), 1,
+                         false);
+    wheelKnob.mouseWheelMove(wev, wd);
+    const double wheelVal = wheelKnob.getValue();  // -20 + 0.5 dB = -19.5
+    wheelOk = std::abs(wheelVal - (-19.5)) < 1.0e-6;
+    std::cout << "[wheel]       -20dB + 1 notch -> " << wheelVal << " dB "
+              << (wheelOk ? "ok" : "FAIL") << std::endl;
+
+    // Smooth mouse: 10 tiny deltas totalling one notch must move exactly one
+    // fine step, not zero (they used to be snapped away individually).
+    SleekRotary smoothKnob;
+    smoothKnob.setRange(-60.0, 4.0, 0.5);
+    smoothKnob.setValue(-30.0, juce::dontSendNotification);
+    juce::MouseWheelDetails sm{};
+    sm.deltaY = (float)(120.0 / 512.0 / 10.0);
+    for (int i = 0; i < 10; ++i)
+      smoothKnob.mouseWheelMove(wev, sm);
+    const double smoothVal = smoothKnob.getValue();  // -30 + 0.5 = -29.5
+    const bool smoothOk = std::abs(smoothVal - (-29.5)) < 1.0e-6;
+    std::cout << "[wheel]       smooth 10x0.0234 -> " << smoothVal << " dB "
+              << (smoothOk ? "ok" : "FAIL") << std::endl;
+    wheelOk = wheelOk && smoothOk;
+  }
+
+  // ---- Double-click must NOT reset the value, and must not change it ----
+  {
+    SleekRotary dblKnob;
+    dblKnob.setRange(-60.0, 4.0, 0.5);
+    dblKnob.setValue(-20.0, juce::dontSendNotification);
+
+    auto &src = juce::Desktop::getInstance().getMainMouseSource();
+    auto clickAt = [&src, &dblKnob](int clicks) {
+      juce::ModifierKeys mods =
+          juce::ModifierKeys::leftButtonModifier;
+      juce::MouseEvent ev(src, juce::Point<float>(40.0f, 40.0f), mods,
+                          0.0f, 0.0f, 0.0f, 0.0f, 0.0f, &dblKnob, &dblKnob,
+                          juce::Time(), juce::Point<float>(), juce::Time(),
+                          clicks, false);
+      dblKnob.mouseDown(ev);
+      dblKnob.mouseUp(ev);
+      dblKnob.mouseDoubleClick(ev);  // what the framework dispatches
+    };
+
+    clickAt(1);  // first click
+    clickAt(2);  // second click (opens the value popup + double-click cb)
+    clickAt(3);  // triple-click: same path as double
+
+    const double afterDbl = dblKnob.getValue();
+    doubleClickOk = std::abs(afterDbl - (-20.0)) < 1.0e-6;
+    std::cout << "[dblclick]    value after 1+2+3 clicks: " << afterDbl
+              << " dB " << (doubleClickOk ? "ok (unchanged)" : "FAIL (reset!)")
+              << std::endl;
+  }
+
   auto snapshot = editor.createComponentSnapshot(editor.getLocalBounds());
 
   if (!snapshot.isValid()) {
@@ -344,7 +446,8 @@ int main(int argc, char **argv) {
             << (belowKnob ? "yes" : "no") << std::endl;
 
   bool ok = (accentPixels > 100 && knobFacePixels > 500 && bezelPixels > 200) &&
-            laOk && fbOk && belowKnob;
+            laOk && fbOk && belowKnob && valueInputOk && wheelOk &&
+            doubleClickOk;
 
   juce::File out =
       juce::File::getCurrentWorkingDirectory().getChildFile("render_test.png");
