@@ -251,8 +251,10 @@ int main(int argc, char **argv) {
     *laOnParam = true;
     runOnce();
     const int latOn = processor.getLatencySamples();
+    // The reported latency must match the *actual* lookahead delay (5 ms here),
+    // not a constant maximum - otherwise the host advances the track.
     const int latExpected =
-        juce::roundToInt(10.0 * 0.001 * 44100.0);  // rate passed to prepareToPlay
+        juce::roundToInt(5.0 * 0.001 * 44100.0);  // rate passed to prepareToPlay
     std::cout << "[lookahead]   off lat=" << latOff << " (want 0), on lat="
               << latOn << " (want " << latExpected << ")" << std::endl;
     *laOnParam = false;
@@ -278,6 +280,50 @@ int main(int argc, char **argv) {
               << std::endl;
     *fbParam = false;
     for (int r = 0; r < 5; ++r) runOnce();
+  }
+
+  // ---- Lookahead must NOT swell the tail before the release curve ----
+  // The detector runs on the undelayed signal, so when the input cuts out it
+  // releases immediately while the delayed audio tail is still loud; without a
+  // hold that tail pops back up toward the input level. A second detector on
+  // the delayed signal must keep the level compressed until the tail is gone.
+  bool lookaheadBumpOk = false;
+  {
+    Compressor c;
+    c.prepare(44100.0, 1);
+    c.setInputGainDb(0.0f);
+    c.setOutputGainDb(0.0f);
+    c.setThresholdDb(-20.0f);
+    c.setRatio(4.0f);
+    c.setKneeDb(0.0f);
+    c.setAttackMs(1.0f);
+    c.setReleaseMs(5.0f);
+    c.setMix(1.0f);
+    c.setLookaheadMs(5.0f);  // 5 ms = 220 samples at 44.1 kHz
+    c.setBypass(false);
+
+    const int sr = 44100;
+    const int burstSamples = sr / 5;  // 200 ms of loud tone
+    const int tailSamples = sr / 8;   // 125 ms of silence after the burst
+    juce::AudioBuffer<float> buf(1, burstSamples + tailSamples);
+    for (int i = 0; i < burstSamples; ++i)
+      buf.setSample(0, i, 0.5f * std::sin(2.0f * juce::MathConstants<float>::pi *
+                                          440.0f * (float)i / sr));
+    for (int i = burstSamples; i < buf.getNumSamples(); ++i)
+      buf.setSample(0, i, 0.0f);
+    c.process(buf, 1, buf.getNumSamples());
+
+    // Steady compression of the 0.5 (-6 dB) tone reduces it to ~0.15. During
+    // the first `lookahead` ms after the cutoff the delayed loud tail is still
+    // audible and must stay compressed - not swell back toward 0.5.
+    const int laSamples = (int)(5.0f * 0.001f * sr);
+    float postPeak = 0.0f;
+    for (int i = burstSamples; i < burstSamples + laSamples; ++i)
+      postPeak = std::max(postPeak, std::abs(buf.getSample(0, i)));
+    lookaheadBumpOk = postPeak < 0.25f;
+    std::cout << "[lookahead]   tail peak after cutoff=" << postPeak
+              << " (expect < 0.25, input was 0.5) "
+              << (lookaheadBumpOk ? "ok" : "FAIL") << std::endl;
   }
 
   // ---- Value-entry popup: snap to step, clamp to min/max ----
@@ -445,9 +491,54 @@ int main(int argc, char **argv) {
   std::cout << "[switches]    LOOKAHEAD below knob: "
             << (belowKnob ? "yes" : "no") << std::endl;
 
+  // ---- Analog-model strip: 7 exclusive buttons, DIGITAL lit by default ----
+  const char *modelNames[] = {"DIGITAL", "2A", "3A", "1176", "2500",
+                              "160",     "609"};
+  auto findModel = [&editor](const juce::String &text) -> PowerSwitch * {
+    for (auto *child : editor.getChildren())
+      if (auto *ps = dynamic_cast<PowerSwitch *>(child))
+        if (ps->getButtonText() == text)
+          return ps;
+    return nullptr;
+  };
+  bool modelsPresent = true;
+  for (const char *name : modelNames)
+    modelsPresent = modelsPresent && findModel(name) != nullptr;
+  std::cout << "[models]      7 buttons present: "
+            << (modelsPresent ? "yes" : "no") << std::endl;
+
+  auto *digitalBtn = findModel("DIGITAL");
+  auto *model2A = findModel("2A");
+  const bool digitalDefault = digitalBtn != nullptr &&
+                              digitalBtn->getToggleState() &&
+                              model2A != nullptr && !model2A->getToggleState();
+  std::cout << "[models]      DIGITAL default-on: "
+            << (digitalDefault ? "yes" : "no") << std::endl;
+
+  // Exclusive radio behaviour: switching the model lights only that button.
+  model2A->onClick();
+  bool exclusive = true;
+  int rightMost = 0;
+  for (const char *name : modelNames) {
+    auto *ps = findModel(name);
+    if (ps == nullptr)
+      continue;
+    exclusive = exclusive && (ps->getToggleState() == (ps == model2A));
+    rightMost = std::max(rightMost, ps->getRight());
+  }
+  std::cout << "[models]      exclusive selection: "
+            << (exclusive ? "yes" : "no") << std::endl;
+
+  // Buttons should leave room for future models (not overflow the panel).
+  const bool fitsStrip = rightMost > 0 && rightMost <= editor.getWidth() - 8;
+  std::cout << "[models]      strip fits with margin: "
+            << (fitsStrip ? "yes" : "no") << std::endl;
+
+  const bool modelOk = modelsPresent && digitalDefault && exclusive && fitsStrip;
+
   bool ok = (accentPixels > 100 && knobFacePixels > 500 && bezelPixels > 200) &&
             laOk && fbOk && belowKnob && valueInputOk && wheelOk &&
-            doubleClickOk;
+            doubleClickOk && modelOk && lookaheadBumpOk;
 
   juce::File out =
       juce::File::getCurrentWorkingDirectory().getChildFile("render_test.png");

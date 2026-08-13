@@ -65,8 +65,11 @@ void Compressor::prepare(double sampleRate, int numChannels) {
   spec.numChannels = (juce::uint32)numChannels_;
 
   envelope_.prepare(sampleRate_, numChannels_);
+  delayedEnvelope_.prepare(sampleRate_, numChannels_);
   lookaheadDelay_.prepare(spec);
   lookaheadDelay_.setMaximumDelayInSamples(maxLookaheadSamples_);
+  scDelay_.prepare(spec);
+  scDelay_.setMaximumDelayInSamples(maxLookaheadSamples_);
 
   sidechainHpf_.clear();
   sidechainHpf_.resize(numChannels_);
@@ -93,7 +96,9 @@ void Compressor::prepare(double sampleRate, int numChannels) {
 //==============================================================================
 void Compressor::reset() {
   envelope_.reset();
+  delayedEnvelope_.reset();
   lookaheadDelay_.reset();
+  scDelay_.reset();
 
   hpfEnabled_ = targetSidechainHpfHz_ > 0.0f;
   for (auto &f : sidechainHpf_) {
@@ -153,24 +158,30 @@ void Compressor::setBypass(bool bypass) { bypass_ = bypass; }
 
 //==============================================================================
 void Compressor::updateSmoothed() {
-  // Attack applies instantly to the envelope follower (cheap store).
+  // Attack applies instantly to the envelope followers (cheap stores).
   envelope_.setAttackTime(targetAttackMs_);
+  delayedEnvelope_.setAttackTime(targetAttackMs_);
 
+  // Share the release ballistics between the main detector and the delayed
+  // hold detector so both recover at the same rate.
+  float releaseMs = targetReleaseMs_;
+  float releaseLogDepth = 8.0f;
   if (releaseAuto_) {
     // Program-dependent release: short bursts above threshold (transients)
     // release fast; long sustained passages release slowly.
     float maxAbove = 0.0f;
     for (float t : aboveTimeS_)
       maxAbove = std::max(maxAbove, t);
-    envelope_.setReleaseTime(juce::jmap(juce::jlimit(0.03f, 0.8f, maxAbove),
-                                        0.03f, 0.8f, 60.0f, 900.0f));
+    releaseMs = juce::jmap(juce::jlimit(0.03f, 0.8f, maxAbove), 0.03f, 0.8f,
+                           60.0f, 900.0f);
     // The AUTO base time already provides the program character; keep the
     // release a plain exponential (no extra log tail) for predictability.
-    envelope_.setReleaseLogDepth(0.0f);
-  } else {
-    envelope_.setReleaseTime(targetReleaseMs_);
-    envelope_.setReleaseLogDepth(8.0f);
+    releaseLogDepth = 0.0f;
   }
+  envelope_.setReleaseTime(releaseMs);
+  delayedEnvelope_.setReleaseTime(releaseMs);
+  envelope_.setReleaseLogDepth(releaseLogDepth);
+  delayedEnvelope_.setReleaseLogDepth(releaseLogDepth);
 
   gainIn_.setTargetValue(
       std::min(juce::Decibels::decibelsToGain(targetInputGainDb_, -200.0f),
@@ -201,6 +212,28 @@ void Compressor::updateSmoothed() {
 }
 
 //==============================================================================
+namespace {
+
+// Static gain-computer curve shared by the undelayed (lookahead) detector and
+// the delayed hold detector. Returns GR in dB (<= 0, so the smaller value is
+// the harder reduction).
+float gainDbForEnvelope(float envDb, float threshDb, float ratioInv,
+                        float kneeDb) {
+  const float slope = 1.0f - ratioInv;  // >= 0 for ratio >= 1
+  const float over = envDb - threshDb + 0.5f * kneeDb;
+  if (over <= 0.0f)
+    return 0.0f;
+  if (kneeDb > 0.0f && over < kneeDb)
+    // Quadratic blend region: [thresh - knee/2, thresh + knee/2].
+    // GR = -slope * over^2 / (2*knee)  (always <= 0 dB, C1-continuous with the
+    // hard-knee branch at over == knee).
+    return -slope * (over * over) / (2.0f * kneeDb);
+  return slope * (threshDb - envDb);
+}
+
+}  // namespace
+
+//==============================================================================
 void Compressor::process(juce::AudioBuffer<float> &buffer, int numChannels,
                          int numSamples) {
   if (numChannels <= 0 || numSamples <= 0)
@@ -215,7 +248,10 @@ void Compressor::process(juce::AudioBuffer<float> &buffer, int numChannels,
   for (int s = 0; s < numSamples; ++s) {
     // Ramp the look-ahead delay per sample (20 ms) so knob moves are clean,
     // click-free and never smear the signal through a fractional delay sweep.
-    lookaheadDelay_.setDelay(lookahead_.getNextValue() * (float)(0.001 * sampleRate_));
+    const float delaySamples =
+        lookahead_.getNextValue() * (float)(0.001 * sampleRate_);
+    lookaheadDelay_.setDelay(delaySamples);
+    scDelay_.setDelay(delaySamples);
 
     const float inGain = gainIn_.getNextValue();
     const float outGain = gainOut_.getNextValue();
@@ -261,18 +297,7 @@ void Compressor::process(juce::AudioBuffer<float> &buffer, int numChannels,
       float gainLin = 1.0f;
       grDb = 0.0f;
       if (!bypass_) {
-        const float slope = 1.0f - ratioInv;  // >= 0 for ratio >= 1
-        const float over = envDb - threshDb + 0.5f * kneeDb;
-        if (over <= 0.0f) {
-          grDb = 0.0f;
-        } else if (kneeDb > 0.0f && over < kneeDb) {
-          // Quadratic blend region: [thresh - knee/2, thresh + knee/2].
-          // GR = -slope * over^2 / (2*knee)  (always <= 0 dB, C1-continuous
-          // with the hard-knee branch at over == knee).
-          grDb = -slope * (over * over) / (2.0f * kneeDb);
-        } else {
-          grDb = slope * (threshDb - envDb);
-        }
+        grDb = gainDbForEnvelope(envDb, threshDb, ratioInv, kneeDb);
         gainLin = juce::Decibels::decibelsToGain(grDb, -200.0f);
       }
 
@@ -282,11 +307,35 @@ void Compressor::process(juce::AudioBuffer<float> &buffer, int numChannels,
       lookaheadDelay_.pushSample(ch, wetIn);
       const float delayed = lookaheadDelay_.popSample(ch);
 
-      // Extension point reserved for the analog saturation stage.
+      // The sidechain, delayed by the same amount: the signal the main detector
+      // reacts to, seen at the time the captured audio will reach the output.
+      scDelay_.pushSample(ch, sc);
+      const float scDelayed = scDelay_.popSample(ch);
+
+      // Release-bump prevention (feed-forward only): when the input cuts out,
+      // the undelayed detector releases straight away while the delayed audio
+      // tail is still playing, so the gain would recover back into it and
+      // audibly swell before the release curve. A second detector on the
+      // delayed sidechain holds the gain until the tail is actually gone;
+      // taking the smaller (more reduced) of the two gains keeps the lookahead
+      // attack advantage without letting the tail pop back up. With zero
+      // lookahead the delayed sidechain equals the undelayed one, so this
+      // reduces to the plain compressor. Feedback mode already tracks the
+      // delayed output, so its character is left untouched.
+      float gainFinal = gainLin;
+      if (!bypass_ && !feedbackMode_) {
+        const float envDbD = juce::Decibels::gainToDecibels(
+            delayedEnvelope_.processSample(ch, std::abs(scDelayed)), -200.0f);
+        const float grDbHold =
+            gainDbForEnvelope(envDbD, threshDb, ratioInv, kneeDb);
+        const float gainHold =
+            juce::Decibels::decibelsToGain(grDbHold, -200.0f);
+        gainFinal = std::min(gainLin, gainHold);
+        grDb = std::min(grDb, grDbHold);  // meter shows the applied reduction
+      }
+
       float wetOut = delayed;
-      if (saturationFn_ != nullptr)
-        saturationFn_(wetOut);
-      wetOut *= gainLin;
+      wetOut *= gainFinal;
 
       // Feedback tap: hand the compressed wet signal back to the detector for
       // the next sample (only read in feedback mode).

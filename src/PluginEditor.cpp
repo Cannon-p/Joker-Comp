@@ -31,13 +31,17 @@ CompressorAudioProcessorEditor::CompressorAudioProcessorEditor(
   addAndMakeVisible(lookaheadSwitch_);
   addAndMakeVisible(feedbackSwitch_);
 
-  // Reserved analog-modeling stage toggles. SATURATION is already wired to the
-  // DSP tap point (Compressor::setSaturationStage); the rest are placeholders
-  // for the analog engine that will be developed next.
-  addModelingButton("SATURATION", true);
-  addModelingButton("HARMONICS", false);
-  addModelingButton("TUBE", false);
-  addModelingButton("TAPE", false);
+  // Analog-model select strip: exclusive mode buttons. The analog engines are
+  // not wired into the DSP yet, so the selected model is UI state for now;
+  // DIGITAL is switched on below as the default (the engine developed so far).
+  addModelButton("DIGITAL");
+  addModelButton("2A");
+  addModelButton("3A");
+  addModelButton("1176");
+  addModelButton("2500");
+  addModelButton("160");
+  addModelButton("609");
+  modelButtons_.getFirst()->setToggleState(true, juce::dontSendNotification);
 
   // Row 1: Threshold, Ratio, Lookahead, Attack, Release
   addKnob("threshold", "THRESHOLD",
@@ -138,16 +142,15 @@ void CompressorAudioProcessorEditor::updateLookaheadKnobState() {
 }
 
 //==============================================================================
-void CompressorAudioProcessorEditor::addModelingButton(
-    const juce::String &caption, bool wiredToDsp) {
+void CompressorAudioProcessorEditor::addModelButton(
+    const juce::String &caption) {
   auto *button = new PowerSwitch(caption);
-  if (wiredToDsp) {
-    // Saturation toggle: enable the placeholder tanh stage through the DSP's
-    // reserved tap point. (UI thread only - acceptable for the placeholder.)
-    button->onStateChange = [button, this]() {
-      audioProcessor.setSaturationEnabled(button->getToggleState());
-    };
-  }
+  // Exclusive radio behaviour: clicking a model lights that button and dims
+  // all the others. The strips aren't wired to the DSP yet.
+  button->onClick = [this, button]() {
+    for (auto *b : modelButtons_)
+      b->setToggleState(b == button, juce::dontSendNotification);
+  };
   addAndMakeVisible(button);
   modelButtons_.add(button);
 }
@@ -227,12 +230,18 @@ void CompressorAudioProcessorEditor::resized() {
 
   modelPanel_.setBounds(12, 486, w - 24, 62);
 
-  const int bx = 14 + 200;
-  const int by = 486 + 20;
-  const int bw = 118;
-  const int bh = 30;
-  for (int i = 0; i < modelButtons_.size(); ++i)
-    modelButtons_[i]->setBounds(bx + i * (bw + 14), by, bw, bh);
+  // Model select strip: sits to the right of the "Analog Modeling" title and
+  // flows left-to-right. Buttons are compact so the strip fits the 7 current
+  // models and still leaves room on the right for more to be added later.
+  constexpr int btnW = 72;
+  constexpr int btnH = 30;
+  constexpr int gap = 12;
+  int bx = modelPanel_.getX() + 180;
+  const int by = modelPanel_.getY() + 18;
+  for (int i = 0; i < modelButtons_.size(); ++i) {
+    modelButtons_[i]->setBounds(bx, by, btnW, btnH);
+    bx += btnW + gap;
+  }
 }
 
 //==============================================================================

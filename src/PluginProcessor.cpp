@@ -47,13 +47,6 @@ int clampIndex(int index, int size) { return juce::jlimit(0, size - 1, index); }
 // constant host-latency figure reported while the lookahead switch is on.
 constexpr float kMaxLookaheadMs = 10.0f;
 
-// Placeholder analog-modeling stage: a gentle tanh waveshaper. This is where
-// the real saturation / harmonic engine will be developed later.
-void softSaturate(float &wet) {
-  constexpr float drive = 1.5f;
-  wet = std::tanh(wet * drive) / drive;
-}
-
 }  // namespace
 
 //==============================================================================
@@ -307,22 +300,18 @@ void CompressorAudioProcessor::updateCompressorParameters() {
     compressor_.setBypass(paramBypass_->get());
 
   // The look-ahead delay line adds delay to the audio path; keep the host's
-  // latency figure in sync so it applies the correct delay compensation. When
-  // the lookahead switch is on the reported latency is the constant maximum
-  // (10 ms) regardless of the knob value, so the host's compensation never has
-  // to chase the knob.
+  // latency figure in sync so it applies the correct delay compensation to the
+  // other tracks. Report the *actual* delay: reporting a constant maximum here
+  // made the track play early (the host compensated for 10 ms while the audio
+  // was only delayed by the chosen knob value).
+  const float laMs =
+      (paramLookahead_ != nullptr && laOn) ? paramLookahead_->get() : 0.0f;
   const int latency =
-      laOn ? juce::roundToInt(kMaxLookaheadMs * 0.001 * sampleRate_.load())
-           : 0;
+      juce::roundToInt(laMs * 0.001 * sampleRate_.load());
   if (latency != reportedLatency_) {
     reportedLatency_ = latency;
     setLatencySamples(latency);
   }
-}
-
-//==============================================================================
-void CompressorAudioProcessor::setSaturationEnabled(bool enabled) {
-  compressor_.setSaturationStage(enabled ? &softSaturate : nullptr);
 }
 
 //==============================================================================

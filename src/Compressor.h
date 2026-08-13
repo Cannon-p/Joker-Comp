@@ -22,9 +22,9 @@
                                                       |
                                                       +-- output gain --> output
 
-    The class exposes a ready-made tap point for a future analog-modeling
-    / saturation stage (see setSaturationStage). This keeps the DSP
-    extension-friendly without adding unused code paths today.
+    The class keeps the signal chain free of any built-in analog-modeling /
+    saturation stage; that engine will be added behind the upcoming model
+    selector once developed.
 
   ==============================================================================
 */
@@ -102,11 +102,9 @@ class Compressor {
   void setSampleRate(double sampleRate) { sampleRate_ = sampleRate; }
 
   //==============================================================================
-  // Extension point reserved for a future analog-modeling / saturation stage.
-  // When set (non-null), the callback is invoked once per channel sample on
-  // the wet signal, right before the dry/wet mix. Leave unset for now.
-  using SaturationFn = void (*)(float &wet);
-  void setSaturationStage(SaturationFn fn) { saturationFn_ = fn; }
+  // Extension point reserved for a future analog-modeling stage. The GUI's model
+  // selector is UI-only for now; wiring the selected model into the DSP comes
+  // with the analog engine itself.
 
   //==============================================================================
   // In-place processing of the whole buffer using maxChannels channels.
@@ -151,10 +149,19 @@ class Compressor {
 
   // State
   EnvelopeFollower envelope_;
+  // Second detector on the *delayed* audio: holds the gain while the delayed
+  // tail of a loud passage is still playing, so the lookahead gain cannot
+  // release back into that tail and swell the audio before the release curve.
+  EnvelopeFollower delayedEnvelope_;
   // Thiran (allpass) interpolation: a fractional lookahead delay without the
   // low-pass filtering that linear interpolation would add to the signal.
   juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Thiran>
       lookaheadDelay_;
+  // A second delay line carrying the (sidechain) signal the main detector sees,
+  // so the release-hold detector can watch exactly what the audio tail will
+  // sound like at the output, including the HPF / feedback processing.
+  juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Thiran>
+      scDelay_;
 
   // One-pole high-pass used to strip low-frequency energy from the sidechain
   // before the envelope detector (DC-blocker with unity gain at Nyquist).
@@ -194,7 +201,5 @@ class Compressor {
 
   int maxLookaheadSamples_ = 0;
   int numChannels_ = 0;
-
-  SaturationFn saturationFn_ = nullptr;
 
 };

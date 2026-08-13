@@ -63,9 +63,6 @@ class CompressorAudioProcessor : public juce::AudioProcessor {
   float getInputLevelDb() const noexcept { return inputLevelDb_.load(); }
   float getOutputLevelDb() const noexcept { return outputLevelDb_.load(); }
 
-  // Wires/unwires the reserved analog-modeling tap point (editor UI only).
-  void setSaturationEnabled(bool enabled);
-
  private:
   //==============================================================================
   juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();

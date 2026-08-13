@@ -34,7 +34,7 @@ class CompressorAudioProcessorEditor : public juce::AudioProcessorEditor,
   //==============================================================================
   SleekRotary *addKnob(const char *paramId, const juce::String &caption,
                        std::function<juce::String(float)> formatter);
-  void addModelingButton(const juce::String &caption, bool wiredToDsp);
+  void addModelButton(const juce::String &caption);
   void updateLookaheadKnobState();
 
   juce::OwnedArray<SleekRotary> knobs_;
@@ -60,7 +60,9 @@ class CompressorAudioProcessorEditor : public juce::AudioProcessorEditor,
   Panel meterPanel_{"GR"};
   Panel modelPanel_{"Analog Modeling"};
 
-  // Reserved analog-modeling stage toggles (future development).
+  // Analog-model selector buttons: exactly one stays lit (radio behaviour).
+  // DIGITAL (the engine developed so far) is the default; the analog models
+  // are UI placeholders until their DSP is built.
   juce::OwnedArray<PowerSwitch> modelButtons_;
 
   // Meters
